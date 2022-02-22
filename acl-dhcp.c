@@ -597,7 +597,7 @@ char *pid_path="/var/run/"SELF_NAME".pid";              // PID file path
 char *fifo_path="/tmp/"SELF_NAME".fifo";                // FIFO file path
 
 void usage() {
-    printf("Usage: "SELF_NAME" -i <interface> [-m <MAC address>] [-r <DHCP renew interval in sec>] [-g <gateway IP address>] start|stop|restart|status|log\n");
+    printf("Usage: "SELF_NAME" [-i <interface>] [-m <MAC address>] [-r <DHCP renew interval in sec>] [-g <gateway IP address>] start|stop|restart|status|log\n");
 }
 
 int is_running() {
