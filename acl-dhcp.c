@@ -338,28 +338,30 @@ u_int8_t dhcp_do(u_int8_t ask) {
             dhcp_client.last_msg_type=DHCP_MESSAGE_TYPE_DISCOVER;
             cast=DHCP_SEND_BROADCAST;
             dhcp_option_add_msg_type(options, &pos, DHCP_MESSAGE_TYPE_DISCOVER);
-//            dhcp_option_add(options, &pos, DHCP_OPTION_CLIENT_ID, (u_int8_t *)dhcp_client.mac, 6);
+            dhcp_option_add(options, &pos, DHCP_OPTION_CLIENT_ID, (u_int8_t *)dhcp_client.mac, 6);
             break;
-        case DHCP_ASK_REQUEST:
+        case DHCP_ASK_REQUEST: {
             dhcp_client.status=DHCP_CLIENT_REQUESTING;
             dhcp_client.last_msg_type=DHCP_MESSAGE_TYPE_REQUEST;
             cast=DHCP_SEND_BROADCAST;
             dhcp_option_add_msg_type(options, &pos, DHCP_MESSAGE_TYPE_REQUEST);
-//            dhcp_option_add(options, &pos, DHCP_OPTION_CLIENT_ID, (u_int8_t *)dhcp_client.mac, 6);
+            dhcp_option_add(options, &pos, DHCP_OPTION_CLIENT_ID, (u_int8_t *)dhcp_client.mac, 6);
             u_int32_t data = htonl(dhcp_client.ip);
             dhcp_option_add(options, &pos, DHCP_OPTION_ADDRESS_REQUEST, (u_int8_t *)&data, sizeof(u_int32_t));
             data = htonl(dhcp_client.server_ip);
             dhcp_option_add(options, &pos, DHCP_OPTION_SERVER_ID, (u_int8_t *)&data, sizeof(u_int32_t));
-            u_int8_t list[] = {DHCP_OPTION_SUBNET_MASK, DHCP_OPTION_ROUTER};
+            u_int8_t list[] = {DHCP_OPTION_SUBNET_MASK, DHCP_OPTION_ROUTER, DHCP_OPTION_ADDRESS_TIME, DHCP_OPTION_RENEWAL_TIME, DHCP_OPTION_REBINDING_TIME};
             dhcp_option_add(options, &pos, DHCP_OPTION_PARAMETER_LIST, (u_int8_t *)list, sizeof(list));
-            break;
-        case DHCP_ASK_RENEW:
+            break; }
+        case DHCP_ASK_RENEW: {
             dhcp_client.status=DHCP_CLIENT_RENEWING;
             dhcp_client.last_msg_type=DHCP_MESSAGE_TYPE_REQUEST;
             cast=DHCP_SEND_UNICAST;
             dhcp_option_add_msg_type(options, &pos, DHCP_MESSAGE_TYPE_REQUEST);
-//            dhcp_option_add(options, &pos, DHCP_OPTION_CLIENT_ID, (u_int8_t *)dhcp_client.mac, 6);
-            break;
+            u_int8_t list[] = {DHCP_OPTION_ROUTER, DHCP_OPTION_ADDRESS_TIME, DHCP_OPTION_RENEWAL_TIME, DHCP_OPTION_REBINDING_TIME};
+            dhcp_option_add(options, &pos, DHCP_OPTION_PARAMETER_LIST, (u_int8_t *)list, sizeof(list));
+            dhcp_option_add(options, &pos, DHCP_OPTION_CLIENT_ID, (u_int8_t *)dhcp_client.mac, 6);
+            break; }
     }
     dhcp_option_end(options, &pos);
         
