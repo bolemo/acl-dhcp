@@ -13,6 +13,8 @@
 #include <fcntl.h>
 #include <poll.h>
 
+static pcap_t *pcap_handle; // one handle shared for DHCP-CLIENT and ARP-PING
+
 //
 //  DHCP-CLIENT -->
 //
@@ -114,18 +116,8 @@ typedef struct dhcp_msg {
     u_int32_t rebinding_time;
 } dhcp_msg_t;
 
-typedef struct acl_dhcp_arguments {
-    u_int8_t if_flag;
-    u_int8_t mac_flag;
-    u_int8_t mac[6];
-    u_int32_t router_ip;
-    unsigned int renew_duration;
-} acl_dhcp_arguments_t;
-
 // GLOBALS
-static pcap_t *pcap_handle;
 static dhcp_client_t dhcp_client;
-static acl_dhcp_arguments_t acl_dhcp_arguments;
 
 u_int8_t dhcp_client_status() {
     if (dhcp_client.status<DHCP_CLIENT_RENEWING) return dhcp_client.status;
@@ -139,22 +131,8 @@ u_int8_t dhcp_client_status() {
     return dhcp_client.status;
 }
 
-unsigned int acl_dhcp_renew_duration() {
-    return (acl_dhcp_arguments.renew_duration)?acl_dhcp_arguments.renew_duration:dhcp_client.renewal_duration;
-}
-u_int8_t acl_dhcp_renew() {
-    return (time(NULL)>dhcp_client.lease_start_time+acl_dhcp_renew_duration());
-}
-u_int32_t* acl_dhcp_router_ip() {
-    return (acl_dhcp_arguments.router_ip)?&acl_dhcp_arguments.router_ip:&dhcp_client.router_ip;
-}
-
-/*
- * Return checksum for the given data.
- * Copied from FreeBSD
- */
-static unsigned short in_cksum(unsigned short *addr, int len)
-{
+// Return checksum for the given data.
+static unsigned short in_cksum(unsigned short *addr, int len) {
     register int sum = 0;
     u_short answer = 0;
     register u_short *w = addr;
@@ -173,8 +151,7 @@ static unsigned short in_cksum(unsigned short *addr, int len)
     return (answer);
 }
 
-static void get_dhcp_options(u_int8_t *frame, dhcp_msg_t *dhcp_msg)
-{
+static void get_dhcp_options(u_int8_t *frame, dhcp_msg_t *dhcp_msg) {
     u_int8_t cur_index, cur_len;
     for (cur_index=0; (cur_len = frame[cur_index + 1]); cur_index += cur_len + 2) switch (frame[cur_index]) {
         case DHCP_OPTION_SUBNET_MASK:
@@ -196,8 +173,7 @@ static void get_dhcp_options(u_int8_t *frame, dhcp_msg_t *dhcp_msg)
     return;
 }
 
-static void net_input(u_char *arg, const struct pcap_pkthdr *header, const u_char *frame)
-{
+static void net_input(u_char *arg, const struct pcap_pkthdr *header, const u_char *frame) {
     struct ether_header *eframe = (struct ether_header *)frame;
     if (htons(eframe->ether_type) != ETHERTYPE_IP) return; // we want an IP frame
     
@@ -225,8 +201,7 @@ static void net_input(u_char *arg, const struct pcap_pkthdr *header, const u_cha
 
 #define DHCP_SEND_BROADCAST 0
 #define DHCP_SEND_UNICAST   1
-static int net_output(u_int8_t *options, unsigned int *opt_len, u_int8_t cast)
-{
+static int net_output(u_int8_t *options, unsigned int *opt_len, u_int8_t cast) {
     int len = 0;
     u_char packet[4096];
     struct udphdr *udp_header;
@@ -381,7 +356,7 @@ u_int8_t dhcp_do(u_int8_t ask) {
     pcap_loop(pcap_handle, -1, net_input, (u_char*)&dhcp_msg);
     alarm(0);
     pcap_close(pcap_handle);
-    if (dhcp_alarm_triggered) { /*fprintf(stderr,"timeout reached!\n");*/ return 0; }
+    if (dhcp_alarm_triggered) return 0;
     
     // ANWSER RECEIVED
     dhcp_client.last_msg_type=dhcp_msg.type;
@@ -458,6 +433,15 @@ void dhcp_init(char *dev, u_int8_t *mac, u_int8_t timeout) {
 #define FRAME_ARP_THA    32
 #define FRAME_ARP_TPA    38
 
+#define ARP_SEND_BROADCAST 0
+#define ARP_SEND_UNICAST   1
+typedef struct arp_ping_args {
+    u_int8_t    smac[6];
+    u_int32_t   sip;
+    u_int8_t    dmac[6];
+    u_int32_t   dip;
+    u_int8_t    mode;   // UNICAST or BROADCAST
+} arp_ping_args_t;
 
 u_int8_t arp_alarm_triggered=0;
 void arp_alarm_timeout(int sig) {
@@ -465,14 +449,16 @@ void arp_alarm_timeout(int sig) {
     arp_alarm_triggered=1;
 }
 
-#define ARP_SEND_BROADCAST 0
-#define ARP_SEND_UNICAST   1
-static void arp_send_request(u_int8_t *smac, u_int32_t *sip, u_int8_t *dmac, u_int32_t *dip) {
+static void arp_send_request(arp_ping_args_t *args) {
     u_int8_t packet[42];
+    static const u_int8_t bmac[6]={0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    u_int8_t *dmac;
+    if (args->mode==ARP_SEND_UNICAST) dmac=(u_int8_t *)&args->dmac;
+    else dmac=(u_int8_t *)&bmac;
     
     // build ethernet header
     memcpy(&packet[FRAME_MAC_DST], dmac, 6);
-    memcpy(&packet[FRAME_MAC_SRC], smac, 6);
+    memcpy(&packet[FRAME_MAC_SRC], &args->smac, 6);
     *(u_int16_t *)&packet[FRAME_ETHERTYPE]=htons(ETHERTYPE_ARP);
     
     // build arp header
@@ -483,58 +469,47 @@ static void arp_send_request(u_int8_t *smac, u_int32_t *sip, u_int8_t *dmac, u_i
     *(u_int16_t *)&packet[FRAME_ARP_OPER]=htons(ARP_REQUEST);
     
     // build arp message
-    memcpy(&packet[FRAME_ARP_SHA], smac, 6);
-    *(u_int32_t *)&packet[FRAME_ARP_SPA]=htonl(*sip);
+    memcpy(&packet[FRAME_ARP_SHA], &args->smac, 6);
+    *(u_int32_t *)&packet[FRAME_ARP_SPA]=htonl(args->sip);
     memcpy(&packet[FRAME_ARP_THA], dmac, 6);
-    *(u_int32_t *)&packet[FRAME_ARP_TPA]=htonl(*dip);
+    *(u_int32_t *)&packet[FRAME_ARP_TPA]=htonl(args->dip);
     
-    /* Send the packet on wire */
+    // send the packet
     int result = pcap_inject(pcap_handle, packet, sizeof(packet));
     if (result <= 0) pcap_perror(pcap_handle, "ERROR:");
 }
 
-static void arp_listen_for_reply(u_char *arg, const struct pcap_pkthdr *header, const u_char *frame) {
-    u_int32_t tpa = htonl(dhcp_client.ip),
-              spa = htonl(*acl_dhcp_router_ip());
+static void arp_listen_for_reply(u_char *args, const struct pcap_pkthdr *header, const u_char *frame) {
+    u_int32_t   tpa = htonl(((arp_ping_args_t *)args)->sip),
+                spa = htonl(((arp_ping_args_t *)args)->dip);
     
     if (   (*(u_int16_t *)&frame[FRAME_ETHERTYPE] == htons(ETHERTYPE_ARP)) // we want an ARP frame
         && (*(u_int16_t *)&frame[FRAME_ARP_OPER] == htons(ARP_REPLY))      // we want an ARP reply
         && (memcmp(&frame[FRAME_ARP_SPA], &spa, 4) == 0)                   // we want reply from gateway
         && (memcmp(&frame[FRAME_ARP_TPA], &tpa, 4) == 0) )                 // we want reply to us
-            pcap_breakloop(pcap_handle);
+        pcap_breakloop(pcap_handle);
     return;
 }
 
 #define ARP_TIMEOUT 5
-u_int8_t arp_ping() {
+u_int8_t arp_ping(arp_ping_args_t *args) {
     char errbuf[PCAP_ERRBUF_SIZE];
     if ((pcap_handle = pcap_open_live(dhcp_client.dev, BUFSIZ, 0, 10, errbuf)) == NULL) {
         fprintf(stderr, "Couldn't open device %s: %s", dhcp_client.dev, errbuf); return 0;
     }
-    u_int8_t attemps=0;
-
-    do {
-        // ARP Request
-        if (attemps==0) { // try unicast
-            arp_send_request(dhcp_client.mac, &dhcp_client.ip, dhcp_client.server_mac, acl_dhcp_router_ip());
-        } else {          // try broadcast
-            u_int8_t bmac[6]; memset(bmac, -1, 6);
-            arp_send_request(dhcp_client.mac, &dhcp_client.ip, bmac, acl_dhcp_router_ip());
-        }
     
-        // ARP Reply
-        arp_alarm_triggered=0;
-        signal(SIGALRM, arp_alarm_timeout);
-        alarm(ARP_TIMEOUT);
-        pcap_loop(pcap_handle, -1, arp_listen_for_reply, NULL);
-        alarm(0);
-    } while (arp_alarm_triggered && (++attemps<2));
+    // ARP Request
+    arp_send_request(args);
     
+    // ARP Reply
+    arp_alarm_triggered=0;
+    signal(SIGALRM, arp_alarm_timeout);
+    alarm(ARP_TIMEOUT);
+    pcap_loop(pcap_handle, -1, arp_listen_for_reply, (u_char *)args);
+    alarm(0);
     pcap_close(pcap_handle);
     
-    if (arp_alarm_triggered) { /*fprintf(stderr, "timeout reached!\n");*/ return 0; }
-    
-    return 1;
+    return (!arp_alarm_triggered);
 }
 
 //
@@ -590,6 +565,26 @@ static void print_dhcp_msg(dhcp_msg_t *dhcpm) {
 
 #define SELF_NAME "acl-dhcp"
 
+typedef struct acl_dhcp_arguments {
+    u_int8_t if_flag;
+    char iface[80];
+    u_int8_t mac_flag;
+    u_int8_t mac[6];
+    u_int32_t router_ip;
+    unsigned int renew_duration;
+} acl_dhcp_arguments_t;
+static acl_dhcp_arguments_t acl_dhcp_arguments;
+
+unsigned int acl_dhcp_renew_duration() {
+    return (acl_dhcp_arguments.renew_duration)?acl_dhcp_arguments.renew_duration:dhcp_client.renewal_duration;
+}
+u_int8_t acl_dhcp_renew() {
+    return (time(NULL)>dhcp_client.lease_start_time+acl_dhcp_renew_duration());
+}
+u_int32_t acl_dhcp_router_ip() {
+    return (acl_dhcp_arguments.router_ip)?acl_dhcp_arguments.router_ip:dhcp_client.router_ip;
+}
+
 void dolog(char *);
 
 char *log_path="/var/log/"SELF_NAME".log";              // Log file path
@@ -621,7 +616,7 @@ void _info() {
     else strcpy(router_mode,"auto");
     if (acl_dhcp_arguments.renew_duration) strcpy(renew_mode,"manual");
     else strcpy(renew_mode,"auto");
-    sprintf(str,"| MAC: "MAC_SF" (%s)\n| Gateway IP: "IP_SF" (%s)\n| Renewal time interval: %i s (%s)", MAC_I(dhcp_client.mac), mac_mode, IP_I(*acl_dhcp_router_ip()), router_mode, acl_dhcp_renew_duration(), renew_mode);
+    sprintf(str,"| MAC: "MAC_SF" (%s)\n| Gateway IP: "IP_SF" (%s)\n| Renewal time interval: %i s (%s)", MAC_I(dhcp_client.mac), mac_mode, IP_I(acl_dhcp_router_ip()), router_mode, acl_dhcp_renew_duration(), renew_mode);
     int fifo = open(fifo_path, O_WRONLY);
     write(fifo, str, FIFO_LEN);
     close(fifo);
@@ -734,10 +729,12 @@ void trimlog() {
     }
 }
 
-void daemon_loop(char *iface) { // This is the daemon
+void daemon_loop() { // This is the daemon
     signal(SIGQUIT,&trap); signal(SIGTERM,&trap); signal(SIGTERM,&trap);
     signal(SIGUSR1,&trap);
-    dhcp_init(iface, (u_int8_t *)&acl_dhcp_arguments.mac, 10);
+    dhcp_init(acl_dhcp_arguments.iface, (u_int8_t *)&acl_dhcp_arguments.mac, 10);
+    static arp_ping_args_t arp_args;
+    memcpy(&arp_args.smac, &dhcp_client.mac, 6);
     chdir("/tmp");
     
     while(1) {
@@ -749,19 +746,28 @@ void daemon_loop(char *iface) { // This is the daemon
         sprintf(str, "DHCP: %s(%s/%s)",DHCP_CLIENT[dhcp_status],DHCP_CLIENT_ASKED[dhcp_client.last_asked],DHCP_CLIENT_LAST_MSG_TYPE[dhcp_client.last_msg_type]);
         dolog(str);
         if (dhcp_status!=DHCP_CLIENT_BOUND) continue; // back to while
+
+        memcpy(&arp_args.dmac, &dhcp_client.server_mac, 6);
+        arp_args.sip=dhcp_client.ip;
+        arp_args.dip=acl_dhcp_router_ip();
+        arp_args.mode=ARP_SEND_UNICAST;
         
 		while (!acl_dhcp_renew()) {
             // CHECK WITH ARP IF GATEWAY IS REACHABLE
-            if (!arp_ping()) {
-                dolog("ARP: gateway is not responding");
-                break;
+            if (!arp_ping(&arp_args)) {
+                dolog("ARP: gateway is not responding to unicast request");
+                arp_args.mode=ARP_SEND_BROADCAST;
+                if (!arp_ping(&arp_args)) {
+                    dolog("ARP: gateway is not responding to broadcast request");
+                    break;
+                }
             }
             sleep(10);
         }
     }
 }
 
-void start(char *iface) {
+void start() {
     pid_t cpid;
     if ((cpid=fork())>0) { // PARENT
         FILE *file;
@@ -775,20 +781,20 @@ void start(char *iface) {
     } else if (cpid<0) { // ERROR FORKING
         exit(1);
     } else { // CHILD
-        daemon_loop(iface);
+        daemon_loop();
     }
 }
 
-void check_flags(char *iface) {
+void check_flags() {
     if (!acl_dhcp_arguments.if_flag) {
         fprintf(stderr, "Missing interface (-i argument missing)!\n");
         exit(1);
     }
     u_int8_t nok=0;
     if (!acl_dhcp_arguments.mac_flag) {
-        printf("No MAC address provided, getting it from %s.\n", iface);
-        char addr_path[80];
-        sprintf(addr_path, "/sys/class/net/%s/address", iface);
+        printf("No MAC address provided, getting it from %s.\n", acl_dhcp_arguments.iface);
+        char addr_path[120];
+        sprintf(addr_path, "/sys/class/net/%s/address", acl_dhcp_arguments.iface);
         FILE* file=fopen (addr_path, "r");
         if (file) {
             if (fscanf (file, "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx", &acl_dhcp_arguments.mac[0], &acl_dhcp_arguments.mac[1], &acl_dhcp_arguments.mac[2], &acl_dhcp_arguments.mac[3], &acl_dhcp_arguments.mac[4], &acl_dhcp_arguments.mac[5]) != 6)
@@ -807,10 +813,8 @@ int main(int argc, char *argv[]) {
     int pid=is_running();
     int argv0size = strlen(argv[0]);
     strncpy(argv[0], SELF_NAME, argv0size);
-    static char iface[80];
     
     int opt;
-//    static u_int8_t flag_i=0, flag_m=0;
     while((opt = getopt(argc, argv, ":i:m:r:g:")) != -1) switch(opt) {
         case 'i':
             if (!optarg) break;
@@ -818,7 +822,7 @@ int main(int argc, char *argv[]) {
             strcat(dev_path,optarg);
             struct stat sb;
             if (stat(dev_path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
-                strcpy(iface, optarg);
+                strcpy(acl_dhcp_arguments.iface, optarg);
                 acl_dhcp_arguments.if_flag=1;
             } else {
                 fprintf(stderr,"Interface %s does not exist!\n",optarg);
@@ -871,19 +875,19 @@ int main(int argc, char *argv[]) {
         exit(pid);
     } else if (!strcmp(argv[optind], "start")) {   // START
         if (pid) { fprintf(stderr, SELF_NAME" is already running with PID %i!\n", pid); exit(1); }
-        check_flags(iface);
+        check_flags();
         printf("Starting "SELF_NAME".\n");
-        start(iface);
+        start();
         exit(0);
     } else if (!strcmp(argv[optind], "stop")) {    // STOP
         stop(pid);
         exit(0);
     } else if (!strcmp(argv[optind], "restart")) { // RESTART
-        check_flags(iface);
+        check_flags();
         stop(pid);
         printf("Restarting "SELF_NAME".\n");
         sleep(1);
-        start(iface);
+        start();
         exit(0);
     } else if (!strcmp(argv[optind], "log")) {     // LOG
         cat(log_path);
