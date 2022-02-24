@@ -529,35 +529,6 @@ static const char *DHCP_CLIENT_LAST_MSG_TYPE[] = {
 static const char *DHCP_CLIENT_ASKED[] = {
     "RELEASE", "DISCOVERY", "REQUEST", "RENEW", "REBIND"
 };
-static void print_dhcp_client(dhcp_client_t *dhcpc) {
-    printf("Client MAC: "MAC_SF"\n", MAC_I(dhcpc->mac));
-    printf("Client timeout: %u\n", dhcpc->timeout);
-    printf("Client device: %s\n", dhcpc->dev);
-    printf("XID: %06x\n", dhcpc->xid);
-    printf("Client IP: "IP_SF"\n", IP_I(dhcpc->ip));
-    printf("Server IP: "IP_SF"\n", IP_I(dhcpc->server_ip));
-    printf("Server MAC: "MAC_SF"\n", MAC_I(dhcpc->server_mac));
-//    struct tm *tm_ls = localtime(&dhcpc->lease_expiration_time);
-//    char tstr[19];
-//    strftime(tstr, 26, "%Y-%m-%d %H:%M:%S", tm_ls);
-//    printf("DHCP Lease expiration: %s\n", tstr);
-    printf("DHCP Status: %s\n", DHCP_CLIENT[dhcpc->status]);
-}
-
-static void print_dhcp_msg(dhcp_msg_t *dhcpm) {
-    printf("DHCP Message Type: %i\n",dhcpm->type);
-    struct tm *tm_ls = localtime(&dhcpm->rtime);
-    char tstr[19];
-    strftime(tstr, 26, "%Y-%m-%d %H:%M:%S", tm_ls);
-    printf("DHCP Message Received: %s\n",tstr);
-    printf("Server MAC: "MAC_SF"\n", MAC_I(dhcpm->server_mac));
-    printf("Client IP: "IP_SF"\n", IP_I(dhcpm->client_ip));
-    printf("Server IP: "IP_SF"\n", IP_I(dhcpm->server_ip));
-    printf("Router IP: "IP_SF"\n", IP_I(dhcpm->router_ip));
-    printf("Relay Agent IP: "IP_SF"\n", IP_I(dhcpm->relay_ip));
-    printf("Subnet Mask: "IP_SF"\n", IP_I(dhcpm->subnet_mask));
-    printf("Lease Time: %u\n", dhcpm->address_time);
-}
 
 //
 // DHCP-ACL -->
@@ -592,6 +563,7 @@ int lmn=100;                                            // Log min lines
 int lmx=150;                                            // Log max lines
 char *pid_path="/var/run/"SELF_NAME".pid";              // PID file path
 char *fifo_path="/tmp/"SELF_NAME".fifo";                // FIFO file path
+static u_int8_t arp_status=0;
 
 void usage() {
     printf("Usage: "SELF_NAME" [-i <interface>] [-m <MAC address>] [-r <DHCP renew interval in sec>] [-g <gateway IP address>] start|stop|restart|status|log\n");
@@ -606,17 +578,17 @@ int is_running() {
     return (pid && (kill(pid,0)==0))?pid:0;
 }
 
-#define FIFO_LEN 110
+#define FIFO_LEN 250
 void _info() {
     char str[FIFO_LEN];
-    char mac_mode[7], router_mode[7], renew_mode[7];
+    char mac_mode[15], router_mode[10], renew_mode[10];
     if (acl_dhcp_arguments.mac_flag) strcpy(mac_mode,"manual");
-    else strcpy(mac_mode,"auto");
+    else strcpy(mac_mode,"from interface");
     if (acl_dhcp_arguments.router_ip) strcpy(router_mode,"manual");
-    else strcpy(router_mode,"auto");
+    else strcpy(router_mode,"from DHCP");
     if (acl_dhcp_arguments.renew_duration) strcpy(renew_mode,"manual");
-    else strcpy(renew_mode,"auto");
-    sprintf(str,"| MAC: "MAC_SF" (%s)\n| Gateway IP: "IP_SF" (%s)\n| Renewal time interval: %i s (%s)", MAC_I(dhcp_client.mac), mac_mode, IP_I(acl_dhcp_router_ip()), router_mode, acl_dhcp_renew_duration(), renew_mode);
+    else strcpy(renew_mode,"from DHCP");
+    sprintf(str,"| Interface: %s\n| MAC: "MAC_SF" (%s)\n| Gateway IP: "IP_SF" (%s)\n| ARP link to gateway: %s\n| DHCP renewal time interval: %i s (%s)\n| DHCP status: %s\n| DHCP offered IP: "IP_SF, dhcp_client.dev, MAC_I(dhcp_client.mac), mac_mode, IP_I(acl_dhcp_router_ip()), router_mode, (arp_status)?"OK":"KO", acl_dhcp_renew_duration(), renew_mode, DHCP_CLIENT[dhcp_client_status()], IP_I(dhcp_client.ip));
     int fifo = open(fifo_path, O_WRONLY);
     write(fifo, str, FIFO_LEN);
     close(fifo);
@@ -754,10 +726,10 @@ void daemon_loop() { // This is the daemon
         
 		while (!acl_dhcp_renew()) {
             // CHECK WITH ARP IF GATEWAY IS REACHABLE
-            if (!arp_ping(&arp_args)) {
+            if (!(arp_status=arp_ping(&arp_args))) {
                 dolog("ARP: gateway is not responding to unicast request");
                 arp_args.mode=ARP_SEND_BROADCAST;
-                if (!arp_ping(&arp_args)) {
+                if (!(arp_status=arp_ping(&arp_args))) {
                     dolog("ARP: gateway is not responding to broadcast request");
                     break;
                 }
