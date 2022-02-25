@@ -611,7 +611,7 @@ static void print_dhcp_msg(dhcp_msg_t *dhcpm) {
 // DHCP-ACL -->
 //
 
-#define SELF_NAME "acl-dhcpt"
+#define SELF_NAME "acl-dhcp"
 
 typedef struct acl_dhcp_arguments {
     u_int8_t if_flag;
