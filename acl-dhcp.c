@@ -1,7 +1,11 @@
 #include <net/ethernet.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
-#include <pcap.h>
+#include <sys/socket.h>
+#include <netpacket/packet.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +17,35 @@
 #include <fcntl.h>
 #include <poll.h>
 
-static pcap_t *pcap_handle; // one handle shared for DHCP-CLIENT and ARP-PING
+typedef struct my_socket {
+    int sock;
+    struct sockaddr_ll addr;
+} my_socket_t;
+
+void my_socket_init(my_socket_t *ms, int proto, char *dev, u_int8_t promiscuous) {
+    int p=htons(proto);
+    ms->sock = socket (AF_PACKET, SOCK_RAW, p);
+    // Get the index of the interface
+    struct ifreq if_idx; memset(&if_idx, 0, sizeof(struct ifreq));
+    strncpy(if_idx.ifr_name, dev, IFNAMSIZ-1);
+    if (ioctl(ms->sock, SIOCGIFINDEX, &if_idx) < 0) perror("SIOCGIFINDEX");
+    ms->addr.sll_family = AF_PACKET;
+    ms->addr.sll_ifindex = if_idx.ifr_ifindex;    // Index of the network device
+    ms->addr.sll_halen = ETH_ALEN;                // Address length
+    ms->addr.sll_protocol = p;
+    if (promiscuous) { // if used MAC is different from interface MAC
+        struct packet_mreq mreq = {0};
+        mreq.mr_ifindex = if_idx.ifr_ifindex;
+        mreq.mr_type = PACKET_MR_PROMISC;
+        if (setsockopt(ms->sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == -1) { perror("setsockopt"); exit(1); }
+    }
+}
+
+void my_socket_send_packet_to(my_socket_t *ms, u_int8_t *packet, int len, u_int8_t *dmac) {
+    memcpy(&ms->addr.sll_addr, dmac, 6);         // Destination MAC
+    int result = sendto (ms->sock, packet, len, 0, (struct sockaddr*)&ms->addr, sizeof(struct sockaddr_ll));
+    if (result <= 0) { perror("sendto failed"); exit(1); }
+}
 
 //
 //  DHCP-CLIENT -->
@@ -118,6 +150,7 @@ typedef struct dhcp_msg {
 
 // GLOBALS
 static dhcp_client_t dhcp_client;
+my_socket_t dhcp_sock;
 
 u_int8_t dhcp_client_status() {
     if (dhcp_client.status<DHCP_CLIENT_RENEWING) return dhcp_client.status;
@@ -129,6 +162,11 @@ u_int8_t dhcp_client_status() {
     else if (now>dhcp_client.lease_start_time+dhcp_client.renewal_duration)
         dhcp_client.status=DHCP_CLIENT_RENEWING;
     return dhcp_client.status;
+}
+
+u_int8_t dhcp_alarm_triggered=0;
+void dhcp_alarm_timeout(int sig) {
+    dhcp_alarm_triggered=1;
 }
 
 // Return checksum for the given data.
@@ -173,21 +211,40 @@ static void get_dhcp_options(u_int8_t *frame, dhcp_msg_t *dhcp_msg) {
     return;
 }
 
-static void net_input(u_char *arg, const struct pcap_pkthdr *header, const u_char *frame) {
-    struct ether_header *eframe = (struct ether_header *)frame;
-    if (htons(eframe->ether_type) != ETHERTYPE_IP) return; // we want an IP frame
+u_int8_t dhcp_listen(u_char *arg) {
+    dhcp_alarm_triggered=0;
+    signal(SIGALRM, dhcp_alarm_timeout);
+    alarm(dhcp_client.timeout);
     
-    struct ip *ip_frame = (struct ip *)(frame + sizeof(struct ether_header));
-    if (ip_frame->ip_p != IPPROTO_UDP) return; // we want UDP
-    
-    struct udphdr *udp_frame = (struct udphdr *)((char *)ip_frame + sizeof(struct ip));
-    if (ntohs(udp_frame->uh_sport) != DHCP_SERVER_PORT) return; // we want from DHCP server
-    
-    dhcp_frame_t *dhcp_frame = (dhcp_frame_t *)((char *)udp_frame + sizeof(struct udphdr));
-    if (dhcp_frame->opcode != DHCP_BOOTREPLY) return; // we want a DHCP BOOTREPLY message
-    
-    if ((memcmp(dhcp_client.mac, dhcp_frame->chaddr, sizeof(dhcp_client.mac)) != 0) || (dhcp_frame->xid != ntohl(dhcp_client.xid))) return; // we want the DHCP message to be addressed to the client
+    unsigned char frame[4096];
+    struct ether_header *eframe;
+    struct ip *ip_frame;
+    struct udphdr *udp_frame;
+    dhcp_frame_t *dhcp_frame;
+    u_int loop=1;
+
+    do {
+        if (recv(dhcp_sock.sock,frame,4096,0) < 0) { perror("ERROR: recv"); exit(1); }  // ERROR
+        if (dhcp_alarm_triggered) return 0;                                             // TIMED OUT
         
+        eframe = (struct ether_header *)frame;
+        if (htons(eframe->ether_type) != ETHERTYPE_IP) continue;        // we want an IP frame
+    
+        ip_frame = (struct ip *)(frame + sizeof(struct ether_header));
+        if (ip_frame->ip_p != IPPROTO_UDP) continue;                    // we want UDP
+    
+        udp_frame = (struct udphdr *)((char *)ip_frame + sizeof(struct ip));
+        if (ntohs(udp_frame->uh_sport) != DHCP_SERVER_PORT) continue;   // we want from DHCP server
+    
+        dhcp_frame = (dhcp_frame_t *)((char *)udp_frame + sizeof(struct udphdr));
+        if (dhcp_frame->opcode != DHCP_BOOTREPLY) continue;             // we want a DHCP BOOTREPLY message
+    
+        if ((memcmp(dhcp_client.mac, dhcp_frame->chaddr, sizeof(dhcp_client.mac)) != 0) || (dhcp_frame->xid != ntohl(dhcp_client.xid))) continue;                          // we want the DHCP message to be addressed to the client
+        loop=0;
+    } while (loop);
+    
+    alarm(0);
+
     // FROM HERE, WE KNOW WE GOT A VALID RESPONSE FROM THE SERVER
     dhcp_msg_t *msg_p = (dhcp_msg_t*)arg;
     get_dhcp_options(dhcp_frame->options, msg_p);       // Get the DHCP options
@@ -196,12 +253,17 @@ static void net_input(u_char *arg, const struct pcap_pkthdr *header, const u_cha
     msg_p->client_ip = ntohl(dhcp_frame->yiaddr);       // Get the Client IP
     msg_p->relay_ip = ntohl(dhcp_frame->giaddr);        // Get the Relay Agent IP
     
-    pcap_breakloop(pcap_handle);
+    return 1;   // OK
 }
 
 #define DHCP_SEND_BROADCAST 0
 #define DHCP_SEND_UNICAST   1
-static int net_output(u_int8_t *options, unsigned int *opt_len, u_int8_t cast) {
+void dhcp_send(u_int8_t *options, u_int8_t opt_len, u_int8_t cast) {
+    static const u_int8_t bmac[6]={0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    u_int8_t *dmac;
+    if (cast==DHCP_SEND_UNICAST) dmac=(u_int8_t *)dhcp_client.server_mac;
+    else dmac=(u_int8_t *)&bmac;
+    
     int len = 0;
     u_char packet[4096];
     struct udphdr *udp_header;
@@ -224,8 +286,8 @@ static int net_output(u_int8_t *options, unsigned int *opt_len, u_int8_t cast) {
     dhcp_frame->xid = htonl(dhcp_client.xid);
     if (cast==DHCP_SEND_UNICAST) dhcp_frame->ciaddr = htonl(dhcp_client.ip);
     dhcp_frame->magic_cookie = htonl(DHCP_MAGIC_COOKIE);
-    memcpy(dhcp_frame->options, options, *opt_len);
-    len += *opt_len;
+    memcpy(dhcp_frame->options, options, opt_len);
+    len += opt_len;
     
     // Build UDP layer
     if (len & 1) len += 1;
@@ -257,24 +319,13 @@ static int net_output(u_int8_t *options, unsigned int *opt_len, u_int8_t cast) {
     
     // Build ethernet layer
     memcpy(eframe->ether_shost, dhcp_client.mac, 6);
-    if (cast==DHCP_SEND_UNICAST) memcpy(eframe->ether_dhost, dhcp_client.server_mac, 6);
-    else                         memset(eframe->ether_dhost, -1,  6);
+    memcpy(eframe->ether_dhost, dmac, 6);
     eframe->ether_type = htons(ETHERTYPE_IP);
 
     len += sizeof(struct ether_header);
 
-    // Send the packet
-    int result = pcap_inject(pcap_handle, packet, len);
-    if (result <= 0)
-        pcap_perror(pcap_handle, "ERROR:");
-    
-    return 1;
-}
-
-u_int8_t dhcp_alarm_triggered=0;
-void dhcp_alarm_timeout(int sig) {
-    pcap_breakloop(pcap_handle);
-    dhcp_alarm_triggered=1;
+    // send the packet
+    my_socket_send_packet_to(&dhcp_sock, packet, len, dmac);
 }
 
 void dhcp_option_add(u_int8_t *options, unsigned int *pos, u_int8_t code, u_int8_t *data, u_int8_t len) {
@@ -295,14 +346,7 @@ void dhcp_option_end(u_int8_t *options, unsigned int *pos) {
 }
 
 u_int8_t dhcp_do(u_int8_t ask) {
-    int result;
-    char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_handle = pcap_open_live(dhcp_client.dev, BUFSIZ, 0, 10, errbuf);
-    if (pcap_handle == NULL) {
-        fprintf(stderr, "Couldn't open device %s: %s", dhcp_client.dev, errbuf);
-        return 0;
-    }
-    
+//    int result;
     u_int8_t options[32];
     unsigned int pos=0;
     u_int8_t cast;
@@ -340,23 +384,12 @@ u_int8_t dhcp_do(u_int8_t ask) {
     }
     dhcp_option_end(options, &pos);
         
-    result = net_output(options, &pos, cast);
-    if (result == 0) {
-        fprintf(stderr, "Couldn't send DHCP message on device %s: %s", dhcp_client.dev, errbuf);
-        pcap_close(pcap_handle);
-        return 0;
-    }
+    dhcp_send(options, pos, cast);
     
     /* GET/WAIT FOR ANSWER */
-    dhcp_alarm_triggered=0;
     dhcp_msg_t dhcp_msg;
     memset(&dhcp_msg, 0, sizeof(dhcp_msg_t));
-    signal(SIGALRM, dhcp_alarm_timeout);
-    alarm(dhcp_client.timeout);
-    pcap_loop(pcap_handle, -1, net_input, (u_char*)&dhcp_msg);
-    alarm(0);
-    pcap_close(pcap_handle);
-    if (dhcp_alarm_triggered) return 0;
+    if (!dhcp_listen((u_char*)&dhcp_msg)) return 0; // TIMED OUT
     
     // ANWSER RECEIVED
     dhcp_client.last_msg_type=dhcp_msg.type;
@@ -397,13 +430,15 @@ u_int8_t dhcp_get_lease() {
 }
 
 #define DHCP_DEFAULT_TIMEOUT 10
-void dhcp_init(char *dev, u_int8_t *mac, u_int8_t timeout) {
+void dhcp_init(char *dev, u_int8_t *mac, u_int8_t timeout, u_int8_t promiscuous) {
     srand(time(NULL));
     memset(&dhcp_client, 0, sizeof(dhcp_client_t));
     dhcp_client.xid=random();
     dhcp_client.dev=dev;
     dhcp_client.timeout=(timeout)?timeout:DHCP_DEFAULT_TIMEOUT;
     memcpy(dhcp_client.mac, mac, 6);
+    
+    my_socket_init(&dhcp_sock, ETHERTYPE_IP, dev, promiscuous);
 }
 
 //
@@ -435,6 +470,9 @@ void dhcp_init(char *dev, u_int8_t *mac, u_int8_t timeout) {
 
 #define ARP_SEND_BROADCAST 0
 #define ARP_SEND_UNICAST   1
+
+#define ARP_TIMEOUT 5
+
 typedef struct arp_ping_args {
     u_int8_t    smac[6];
     u_int32_t   sip;
@@ -443,9 +481,14 @@ typedef struct arp_ping_args {
     u_int8_t    mode;   // UNICAST or BROADCAST
 } arp_ping_args_t;
 
+my_socket_t arp_sock;
+
+void arp_ping_init(char *dev, u_int8_t promiscuous) {
+    my_socket_init(&arp_sock, ETHERTYPE_ARP, dev, promiscuous);
+}
+
 u_int8_t arp_alarm_triggered=0;
 void arp_alarm_timeout(int sig) {
-    pcap_breakloop(pcap_handle);
     arp_alarm_triggered=1;
 }
 
@@ -475,41 +518,45 @@ static void arp_send_request(arp_ping_args_t *args) {
     *(u_int32_t *)&packet[FRAME_ARP_TPA]=htonl(args->dip);
     
     // send the packet
-    int result = pcap_inject(pcap_handle, packet, sizeof(packet));
-    if (result <= 0) pcap_perror(pcap_handle, "ERROR:");
+    my_socket_send_packet_to(&arp_sock, packet, sizeof(packet), dmac);
 }
 
-static void arp_listen_for_reply(u_char *args, const struct pcap_pkthdr *header, const u_char *frame) {
+u_int8_t arp_listen(u_char *args) {
+    arp_alarm_triggered=0;
+    signal(SIGALRM, arp_alarm_timeout);
+    alarm(ARP_TIMEOUT);
+    
     u_int32_t   tpa = htonl(((arp_ping_args_t *)args)->sip),
                 spa = htonl(((arp_ping_args_t *)args)->dip);
     
-    if (   (*(u_int16_t *)&frame[FRAME_ETHERTYPE] == htons(ETHERTYPE_ARP)) // we want an ARP frame
-        && (*(u_int16_t *)&frame[FRAME_ARP_OPER] == htons(ARP_REPLY))      // we want an ARP reply
-        && (memcmp(&frame[FRAME_ARP_SPA], &spa, 4) == 0)                   // we want reply from gateway
-        && (memcmp(&frame[FRAME_ARP_TPA], &tpa, 4) == 0) )                 // we want reply to us
-        pcap_breakloop(pcap_handle);
-    return;
+    unsigned char frame[128];
+    
+    do {
+        if (recv(arp_sock.sock,frame,128,0) < 0) { perror("ERROR: recv"); exit(1); }    // ERROR
+        if (arp_alarm_triggered) return 0;                                              // TIMED OUT
+    }
+    while (!(   (*(u_int16_t *)&frame[FRAME_ETHERTYPE] == htons(ETHERTYPE_ARP)) // we want an ARP frame
+        && (*(u_int16_t *)&frame[FRAME_ARP_OPER] == htons(ARP_REPLY))           // we want an ARP reply
+        && (memcmp(&frame[FRAME_ARP_SPA], &spa, 4) == 0)                        // we want reply from gateway
+        && (memcmp(&frame[FRAME_ARP_TPA], &tpa, 4) == 0) ));                    // we want reply to us
+    
+    alarm(0);
+    return 1;
 }
 
-#define ARP_TIMEOUT 5
 u_int8_t arp_ping(arp_ping_args_t *args) {
-    char errbuf[PCAP_ERRBUF_SIZE];
-    if ((pcap_handle = pcap_open_live(dhcp_client.dev, BUFSIZ, 0, 10, errbuf)) == NULL) {
-        fprintf(stderr, "Couldn't open device %s: %s", dhcp_client.dev, errbuf); return 0;
-    }
     
     // ARP Request
     arp_send_request(args);
     
     // ARP Reply
-    arp_alarm_triggered=0;
-    signal(SIGALRM, arp_alarm_timeout);
-    alarm(ARP_TIMEOUT);
-    pcap_loop(pcap_handle, -1, arp_listen_for_reply, (u_char *)args);
-    alarm(0);
-    pcap_close(pcap_handle);
+//    arp_alarm_triggered=0;
+//    signal(SIGALRM, arp_alarm_timeout);
+//    alarm(ARP_TIMEOUT);
+    return arp_listen((u_char *)args);
+//    alarm(0);
     
-    return (!arp_alarm_triggered);
+//    return (!arp_alarm_triggered);
 }
 
 //
@@ -529,12 +576,42 @@ static const char *DHCP_CLIENT_LAST_MSG_TYPE[] = {
 static const char *DHCP_CLIENT_ASKED[] = {
     "RELEASE", "DISCOVERY", "REQUEST", "RENEW", "REBIND"
 };
+/*
+static void print_dhcp_client(dhcp_client_t *dhcpc) {
+    printf("Client MAC: "MAC_SF"\n", MAC_I(dhcpc->mac));
+    printf("Client timeout: %u\n", dhcpc->timeout);
+    printf("Client device: %s\n", dhcpc->dev);
+    printf("XID: %06x\n", dhcpc->xid);
+    printf("Client IP: "IP_SF"\n", IP_I(dhcpc->ip));
+    printf("Server IP: "IP_SF"\n", IP_I(dhcpc->server_ip));
+    printf("Server MAC: "MAC_SF"\n", MAC_I(dhcpc->server_mac));
+//    struct tm *tm_ls = localtime(&dhcpc->lease_expiration_time);
+//    char tstr[19];
+//    strftime(tstr, 26, "%Y-%m-%d %H:%M:%S", tm_ls);
+//    printf("DHCP Lease expiration: %s\n", tstr);
+    printf("DHCP Status: %s\n", DHCP_CLIENT[dhcpc->status]);
+}
 
+static void print_dhcp_msg(dhcp_msg_t *dhcpm) {
+    printf("DHCP Message Type: %i\n",dhcpm->type);
+    struct tm *tm_ls = localtime(&dhcpm->rtime);
+    char tstr[19];
+    strftime(tstr, 26, "%Y-%m-%d %H:%M:%S", tm_ls);
+    printf("DHCP Message Received: %s\n",tstr);
+    printf("Server MAC: "MAC_SF"\n", MAC_I(dhcpm->server_mac));
+    printf("Client IP: "IP_SF"\n", IP_I(dhcpm->client_ip));
+    printf("Server IP: "IP_SF"\n", IP_I(dhcpm->server_ip));
+    printf("Router IP: "IP_SF"\n", IP_I(dhcpm->router_ip));
+    printf("Relay Agent IP: "IP_SF"\n", IP_I(dhcpm->relay_ip));
+    printf("Subnet Mask: "IP_SF"\n", IP_I(dhcpm->subnet_mask));
+    printf("Lease Time: %u\n", dhcpm->address_time);
+}
+*/
 //
 // DHCP-ACL -->
 //
 
-#define SELF_NAME "acl-dhcp"
+#define SELF_NAME "acl-dhcpt"
 
 typedef struct acl_dhcp_arguments {
     u_int8_t if_flag;
@@ -543,6 +620,7 @@ typedef struct acl_dhcp_arguments {
     u_int8_t mac[6];
     u_int32_t router_ip;
     unsigned int renew_duration;
+    u_int8_t promiscuous;
 } acl_dhcp_arguments_t;
 static acl_dhcp_arguments_t acl_dhcp_arguments;
 
@@ -704,7 +782,8 @@ void trimlog() {
 void daemon_loop() { // This is the daemon
     signal(SIGQUIT,&trap); signal(SIGTERM,&trap); signal(SIGTERM,&trap);
     signal(SIGUSR1,&trap);
-    dhcp_init(acl_dhcp_arguments.iface, (u_int8_t *)&acl_dhcp_arguments.mac, 10);
+    dhcp_init(acl_dhcp_arguments.iface, (u_int8_t *)&acl_dhcp_arguments.mac, 10, acl_dhcp_arguments.promiscuous);
+    arp_ping_init(acl_dhcp_arguments.iface, acl_dhcp_arguments.promiscuous);
     static arp_ping_args_t arp_args;
     memcpy(&arp_args.smac, &dhcp_client.mac, 6);
     chdir("/tmp");
@@ -763,17 +842,26 @@ void check_flags() {
         exit(1);
     }
     u_int8_t nok=0;
+    
+    u_int8_t im[6];
+    char addr_path[120];
+    FILE* file;
+    sprintf(addr_path, "/sys/class/net/%s/address", acl_dhcp_arguments.iface);
+    if ((file=fopen (addr_path, "r"))) {
+        if (fscanf (file, "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx", &im[0], &im[1], &im[2], &im[3], &im[4], &im[5]) != 6) nok=1;
+        fclose (file);
+    }
+    
     if (!acl_dhcp_arguments.mac_flag) {
-        printf("No MAC address provided, getting it from %s.\n", acl_dhcp_arguments.iface);
-        char addr_path[120];
-        sprintf(addr_path, "/sys/class/net/%s/address", acl_dhcp_arguments.iface);
-        FILE* file=fopen (addr_path, "r");
-        if (file) {
-            if (fscanf (file, "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx", &acl_dhcp_arguments.mac[0], &acl_dhcp_arguments.mac[1], &acl_dhcp_arguments.mac[2], &acl_dhcp_arguments.mac[3], &acl_dhcp_arguments.mac[4], &acl_dhcp_arguments.mac[5]) != 6)
-                nok=1;
-            fclose (file);
+        printf("No MAC address provided, using MAC of %s.\n", acl_dhcp_arguments.iface);
+        memcpy(&acl_dhcp_arguments.mac, &im, 6);
+    } else {
+        if (memcmp(&acl_dhcp_arguments.mac, &im, 6) != 0) {
+            printf("The MAC address provided is different that the MAC of %s. Using promiscuous mode.\n", acl_dhcp_arguments.iface);
+            acl_dhcp_arguments.promiscuous=1;
         }
     }
+    
     if (nok) {
         fprintf(stderr, "Missing MAC address (-m argument missing or could not get it from given interface)!\n");
         exit(1);
