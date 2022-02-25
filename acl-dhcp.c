@@ -720,10 +720,13 @@ void trap(int sig) {
         case SIGINT:
         case SIGTERM:
         case SIGQUIT:
+        case SIGABRT:
             remove(pid_path);
             char str[80];
             sprintf(str,"DAEMON: exiting (pid: %i)", getpid());
             dolog(str);
+            close(dhcp_sock.sock);
+            close(arp_sock.sock);
             exit(0);
             break;
         case SIGUSR1:
@@ -780,7 +783,7 @@ void trimlog() {
 }
 
 void daemon_loop() { // This is the daemon
-    signal(SIGQUIT,&trap); signal(SIGTERM,&trap); signal(SIGTERM,&trap);
+    signal(SIGQUIT,&trap); signal(SIGTERM,&trap); signal(SIGINT,&trap); signal(SIGABRT,&trap);
     signal(SIGUSR1,&trap);
     dhcp_init(acl_dhcp_arguments.iface, (u_int8_t *)&acl_dhcp_arguments.mac, 10, acl_dhcp_arguments.promiscuous);
     arp_ping_init(acl_dhcp_arguments.iface, acl_dhcp_arguments.promiscuous);
